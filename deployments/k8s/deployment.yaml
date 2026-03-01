@@ -1,0 +1,193 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boardgov
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: boardgov-secrets
+  namespace: boardgov
+type: Opaque
+stringData:
+  DATABASE_DSN: "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+  JWT_ACCESS_SECRET: "CHANGE_ME_64_CHAR_SECRET"
+  JWT_REFRESH_SECRET: "CHANGE_ME_64_CHAR_REFRESH_SECRET"
+  CSRF_SECRET: "CHANGE_ME_32_CHAR_CSRF_SECRET"
+  ENCRYPTION_KEY: "CHANGE_ME_32_BYTE_AES_KEY_PADDED"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: boardgov-config
+  namespace: boardgov
+data:
+  SERVER_PORT: "8080"
+  SERVER_READ_TIMEOUT: "15s"
+  SERVER_WRITE_TIMEOUT: "15s"
+  SERVER_IDLE_TIMEOUT: "60s"
+  SERVER_SHUTDOWN_TIMEOUT: "30s"
+  SERVER_TRUSTED_PROXIES: "10.0.0.0/8"
+  DB_MAX_OPEN_CONNS: "25"
+  DB_MAX_IDLE_CONNS: "10"
+  DB_CONN_MAX_LIFETIME: "5m"
+  DB_CONN_MAX_IDLE_TIME: "1m"
+  JWT_ACCESS_EXPIRY: "15m"
+  JWT_REFRESH_EXPIRY: "168h"
+  JWT_ISSUER: "boardgov"
+  STORAGE_BASE_PATH: "/secure-storage"
+  STORAGE_MAX_FILE_SIZE_MB: "25"
+  SECURITY_IP_WHITELIST: "10.0.0.0/8"
+  RATE_LIMIT_REQUESTS: "100"
+  RATE_LIMIT_PERIOD: "1m"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boardgov
+  namespace: boardgov
+  labels:
+    app: boardgov
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: boardgov
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: boardgov
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: boardgov
+          image: your-registry/boardgov:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: boardgov-config
+            - secretRef:
+                name: boardgov-secrets
+          volumeMounts:
+            - name: secure-storage
+              mountPath: /secure-storage
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: secure-storage
+          persistentVolumeClaim:
+            claimName: boardgov-storage-pvc
+      automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: boardgov-svc
+  namespace: boardgov
+spec:
+  selector:
+    app: boardgov
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: boardgov-storage-pvc
+  namespace: boardgov
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: encrypted-ssd
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: boardgov-netpol
+  namespace: boardgov
+spec:
+  podSelector:
+    matchLabels:
+      app: boardgov
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: nginx-ingress
+      ports:
+        - port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+    - ports:
+        - port: 53
+          protocol: UDP
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: boardgov-pdb
+  namespace: boardgov
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: boardgov
